@@ -50,66 +50,93 @@ The contract-level enforcement we ship (ERC-8211-predicate-based, developed in c
 
 ### Architecture
 
-Two layers, with a clean interface between them.
+A generic intent-batch dispatcher (`PropAMMSettlement`) coordinates calldata that fulfils the user's intent. The user signs ONE EIP-712 message — a Permit2 `PermitWitnessTransferFrom` whose witness is the `Intent` struct — and the orchestrator builds a `Step[]` that achieves the route. Settlement's only opinion is: **the receiver's `tokenOut` balance must grow by at least `minAmountOut`, or the intent reverts**.
 
-#### Layer 1: Shared settlement substrate
+#### What the user signs
 
-One contract per chain, identical for every MM. It handles EIP-712 verification of the user's signed intent and the MM's signed price or per-order quote, pulling the user's `tokenIn` via standard approve, ERC-2612 permit, or Permit2 with intent-hash witness, storing the latest signed anchor price per `(MM, tokenIn, tokenOut)` with freshness gates that fire at settle time, calling into the MM's provider contract for the actual fill, and enforcing atomicity. Funds move through the settlement contract and out within the same transaction; the contract never holds a non-zero balance. Single-use user intent nonces, monotonic MM nonces, deadlines, and optional exclusivity windows are enforced at this layer.
+```
+Intent {
+    address trader        // signer
+    address receiver      // where tokenOut goes
+    address tokenIn
+    uint256 amountIn
+    address tokenOut
+    uint256 minAmountOut  // floor; settlement-enforced
+    address executor      // who can submit; 0 = anyone
+    uint256 deadline
+    uint256 nonce         // Permit2 nonce
+}
+```
 
-#### Layer 2: Per-MM provider contract
+One signature authorises (a) Permit2 to pull up to `amountIn` of `tokenIn`, (b) the intent semantics, and (c) the executor binding (`msg.sender` must equal `intent.executor`, or `executor == 0` for permissionless).
 
-Each market maker deploys their own. It implements a small interface the settlement contract calls during every fill. Inside, the MM has full control: curve-based price padding, counterparty filtering, freshness checks against MM-side state, per-pair fill caps, per-order signed quoting. The settlement contract has no opinion on the internal logic. The provider returns an `amountOut` or reverts; settlement handles either outcome safely.
+#### What the orchestrator submits
 
-#### Two settlement flows
+```
+PropAMMSettlement.settleBatch(
+    Step[]   preHook,           // runs once per batch — commit MM PriceUpdates here
+    Intent[] intents,
+    Step[][] perIntentSteps     // calldata that fulfils each intent
+)
+```
 
-*Streaming.* The MM publishes signed prices continuously. The orchestrator commits the freshest signed price as the on-chain anchor and settles user intents against it. Multiple intents against the same `(MM, pair)` can settle in one batched transaction.
+Per-intent `try/catch` isolation: one bad intent doesn't roll back adjacent ones. The preHook is NOT isolated; revert there aborts the whole batch.
+
+#### Settlement's components
+
+- **`PropAMMSettlement`** — generic Step[] dispatcher. Zero standing approvals. Per-intent try/catch. Owner-managed delegatecall whitelist.
+- **`PropAMMExecutor`** — streaming-MM module. `updatePrices(PUs, sigs)` commits MM-signed anchors with same-block freshness. `fillFromAnchor(...)` reads the freshest anchor and dispatches an exact-amount approve / fill / revoke through the MM provider.
+- **`OrchestratorRelay`** — fronting contract for the orchestrator's relayer EOA pool. Users sign `intent.executor = OrchestratorRelay` once; the orchestrator rotates underlying EOAs behind that address without re-signing.
+- **MM provider** (~100 LoC each) — each MM deploys their own. Two functions: `signer()` returns the PU-signing address (EOA or EIP-1271); `executeSwap()` is gated by `msg.sender == approvedExecutor` and moves inventory. The MM's internal logic is unconstrained — curve pricing, counterparty filtering, per-pair caps, all live inside.
+
+#### Composability via Step[]
+
+The Step-based dispatch is what unlocks the protocol's flexibility. Any combination works in a single intent's `Step[]`:
+
+- **Pure streaming-MM** — Permit2 pull → transfer to executor → `fillFromAnchor` (the production default)
+- **Pure external venue** — Permit2 pull → approve Uniswap → `SwapRouter.exactInputSingle` → revoke
+- **Mixed route** — split the input between PropAMM MM and an external venue, summing deliveries to the receiver
+- **ERC-8211 composability** — delegatecall the owner-whitelisted ERC-8211 module to do runtime-balance reads (e.g. fee split: `transfer(fee_collector, fixed_fee)` then `transfer(user, balanceOf(settlement, tokenOut))`)
+- **Gasless first-time user** — chain a signed EIP-2612 `token.permit()` as Step 0 to grant Permit2 the allowance, then proceed normally
+
+The orchestrator builds the Step[]. Settlement dispatches it. There's no protocol-side allowlist of route shapes — the composability surface is the EVM itself.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant MM as Market Maker
-    participant C as Orchestrator
-    participant U as User
-    participant S as Settlement
+    participant Pub as MM Publisher
+    participant Orch as Orchestrator
+    participant U as User Wallet
+    participant Relay as OrchestratorRelay
+    participant S as PropAMMSettlement
+    participant Exec as PropAMMExecutor
+    participant P as Permit2
 
-    Note over MM,C: continuous price stream
-    MM->>C: signed price update
-    MM->>C: signed price update
-
-    U->>C: signed swap intent
-    C->>S: commitPriceAndSettle (atomic)
-    Note over S: verify sigs<br/>same-block freshness<br/>deadline / nonce checks
-    S->>U: pull tokenIn (gross amountIn)
-    S->>C: route feeAmount (gas reimbursement)
-    S->>MM: provider.executeSwap (net input)
-    MM-->>S: amountOut
-    S->>U: deliver tokenOut
+    Note over MM,Pub: continuous PriceUpdate stream
+    Pub->>Orch: signed PriceUpdate (WS)
+    U->>Orch: /v3/quote
+    Orch-->>U: Intent template (executor=Relay, minAmountOut)
+    U->>Orch: signed Intent witness (EIP-712, 1 sig)
+    Orch->>Relay: relayBatch(preHook, [intent], [steps])
+    Relay->>S: settleBatch(...)
+    S->>Exec: preHook: updatePrices(PUs, sigs)
+    Note over S: snapshot receiver.balance
+    S->>P: permitWitnessTransferFrom (pulls tokenIn → S)
+    S->>Exec: tokenIn.transfer(executor)
+    S->>Exec: fillFromAnchor → tokenOut to receiver
+    Note over S: re-snapshot — delta ≥ minAmountOut → emit IntentSettled
 ```
 
-*Pin-RFQ.* For each user intent, the orchestrator sends a quote request to the MM. The MM runs its own risk checks and either signs a binding quote or declines. Settlement treats the signed quote as a floor on the user's `amountOut`. The MM can pay more; they cannot pay less.
+#### Three relay modes
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant U as User
-    participant C as Orchestrator
-    participant MM as Market Maker
-    participant S as Settlement
+The signed-executor field gives the trader explicit control over how their intent reaches chain:
 
-    U->>C: signed swap intent
-    C->>MM: quote request
-    Note over MM: per-order<br/>risk checks
-    MM-->>C: signed quote (or pass)
-    C->>S: settleWithMMQuote (atomic)
-    Note over S: verify sigs<br/>quote binding<br/>deadlines
-    S->>U: pull tokenIn (gross amountIn)
-    S->>C: route feeAmount
-    S->>MM: provider.executeSwapWithQuote (net input)
-    MM-->>S: amountOut (>= quoted)
-    S->>U: deliver tokenOut
-```
+- **Orchestrator-relayed** (`executor = OrchestratorRelay`). Default UX, gasless from the trader. Orchestrator rotates N relayer EOAs behind one contract address; the trader signs once and the orchestrator can use any EOA without re-quoting.
+- **Self-relay** (`executor = trader's own EOA`). Trader submits `settleBatch` themselves. Zero orchestrator dependency. Native ETH input is exclusive to this mode.
+- **Permissionless** (`executor = address(0)`). Anyone may submit. Trader opts in to MEV exposure for guaranteed inclusion.
 
-Both flows happen in a single transaction. Any step that fails reverts the entire transaction.
+Self-relay supports a "self-PU" pattern (trader supplies their own MM-signed PriceUpdate in the preHook) and a "piggyback" pattern (empty preHook, relies on the orchestrator's same-block anchor commit). The latter is reliable on high-activity pairs where the orchestrator commits in every block; intermittent on sparse pairs.
 
 #### Same-block freshness enforcement
 
@@ -118,10 +145,6 @@ The settlement contract enforces, on every fill, that the MM-signed price was co
 This is how we enforce ordering: as a **standard of EVM execution** — every node verifies it deterministically as part of the normal settle path — rather than as a custom block-builder application that depends on a specific builder being in the lead. There is no MEV-Boost dependency, no Titan-style builder market to maintain, no per-block competition to win. The constraint is part of the contract; it holds on every node, every block, every time. Any chain that runs the EVM can deploy this without bringing along a custom builder stack.
 
 That property — ordering enforced by the EVM itself, not by who built the block — is what closes the cross-block stale-anchor vector that has historically been the dominant toxic-flow path on permissionless L2 propAMMs.
-
-#### Channel choice
-
-Streaming fits an MM that has a fast external price feed to mirror, wants high-throughput open access, and can sign at machine speed from a hot wallet. Pin-RFQ fits an MM that wants per-order signoff, signs from slow infrastructure (HSM or multisig), or applies off-chain risk gates per fill. Users sign the same intent type either way. One MM signing key can run both channels side by side.
 
 ### User and MM protection
 
@@ -137,24 +160,33 @@ The second largest on-chain market maker by volume has committed to deploy on th
 
 ### Performance
 
-Preliminary numbers from Base Sepolia. We'll re-confirm on mainnet after the external audit.
+Numbers from a v3 consolidated load test on Base Sepolia: 10,000 intents across 8 channels (orchestrator-relayed, self-relay × {ERC20, native ETH} × {self-PU, piggyback}, cross-venue, mixed, ERC-8211 fee-split). **Every intent was independently verified on chain via its witness hash matched against `IntentSettled` / `IntentFailed` events in the exact test block window.** No estimates.
 
-One orchestrator instance, one slot (one MM, one pair), settles **310 intents per second, 100% on chain, 0 reverts**, in the orchestrator-mediated path users will take. Verified by counting `SwapSettled` events on chain (not from orchestrator logs) across the test's block range.
+**Headline (per-intent verified on chain):**
 
-Per settled intent at 5-intent batches:
+- **9,949 of 10,000 settled = 99.49% overall on-chain settlement rate**
+- **Orchestrator-relayed channel: 99.64%** (7,979 settled / 8,008 submitted)
+- **Self-relay channels: 98.9% combined** (1,970 settled / 1,992 submitted across 7 channels; 3 channels hit 100% in their sample sizes)
+- The 23 `IntentFailed` events were `AnchorStale` reverts on piggyback channels — correct protocol behavior (trader's tx landed in a block with no orchestrator batch). 28 intents were "truly missing" (no on-chain event in test window) — queue-tail at test cutoff, not a protocol failure
 
-- **~80,000 gas** on chain.
-- **~$0.008** at current Base mainnet conditions (June 5, 2026: L1 base fee 0.4 gwei, ETH $2,000).
+**Per-intent gas:**
 
-At 310 intents/sec per slot, we're using about **16% of Base's per-second gas budget**. The chain has plenty of room above this number — easy to scale up and fill more blockspace from here.
+- ~83k gas per intent on the orchestrator-relayed path (Settlement overhead amortised across the batch's ~2.6 intents avg)
+- ~133–233k gas on self-relay channels depending on route shape (no amortisation; each intent is its own tx)
 
-Full per-step tables, sample receipts, and deployed addresses in `performance-summary.md`.
+**At current Base mainnet conditions** (L1 base fee 0.4 gwei, ETH $2,000): **~$0.008–$0.012 per intent** for the orchestrator-relayed path. Self-relay intents pay full per-tx overhead at $0.018–$0.040.
+
+**Latency p50: 2.2–4.6 seconds.** Self-relay p50 = 2.2–2.7 s (essentially one Base Sepolia block). Orchestrator-relayed p50 = 4.6 s (one block + the batcher's 200ms flush + per-EOA dispatch queueing).
+
+The 7 IPS sustained submission rate was bounded by public-tier RPC throughput, not by the protocol. The architectural ceiling lifts substantially on a dedicated RPC tier — with the 32-EOA relayer pool round-robin, theoretical throughput is ~16 batches/sec ≈ 40–50 IPS.
+
+Full per-channel tables, verification methodology, and gas decomposition in [`performance-summary.md`](./performance-summary.md).
 
 ---
 
 ## Benefits for market makers
 
-**Off-chain participation.** Market makers publish signed price updates (streaming) or per-order quotes (RFQ) over a WebSocket connection. Payloads are signed off chain and consumed by the settlement contract at fill time. Settlement is submitted by the orchestrator's relayer pool, which recovers settlement gas from the user-side `feeAmount` on each fill.
+**Off-chain participation.** Market makers publish signed `PriceUpdate`s over a WebSocket connection. Payloads are signed off chain and consumed by the settlement contract at fill time through the orchestrator's preHook. Settlement is submitted by the orchestrator's relayer pool, which recovers gas as part of the orchestrator's surplus capture (the spread between quoted output and `minAmountOut`).
 
 **Same-block freshness, contract-enforced.** Every settlement must include a price update committed in the same block as the swap. The contract reverts otherwise. The MM-signed `expiresAt` adds a wall-time cap on top. Together these reduce the toxic-flow window from unbounded prior staleness to intra-block residual; intra-block CEX drift remains exploitable on volatile pairs and is the gap that within-block sequencer-side ordering would close.
 
@@ -188,7 +220,7 @@ Trust concentrates on the MM signing key. Every other component is signature-enf
 - **User**: pays gas only via the input token amount. No ETH required, no top-up step, **0% swap fee** on top.
 - **Orchestrator**: pays the full settle-tx gas in ETH from its relayer pool, gets compensated back by the user's input amount via `feeAmount`.
 - **Price update (commit price tx)**: this is a venue-policy choice. The orchestrator can pass the on-chain commit cost through to users (amortised across the batch), absorb it as a venue cost, or split it with the MM as part of the partnership arrangement. All three models are viable; the protocol doesn't prescribe one.
-- **Market maker**: publishes signed price updates (streaming) or per-order quotes (RFQ) over WebSocket. Revenue is the spread embedded in their signed price.
+- **Market maker**: publishes signed `PriceUpdate`s over WebSocket. Revenue is the spread embedded in their signed price.
 
 ### The number
 
