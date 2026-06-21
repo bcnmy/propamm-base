@@ -1,121 +1,84 @@
 # PropAMM on Base: v3 Sepolia load test results
 
-> Measurements from Base Sepolia. v3 architecture (universal Intent + Step[] dispatcher + Permit2 witness binding + signed-executor pinning + cross-venue/delegatecall composability).
->
-> **Every intent in this run was independently verified on chain via its witness hash.** No assumptions, no estimates — the harness queries `IntentSettled` and `IntentFailed` events from the exact test block window and matches each submitted intent's hash against the on-chain event log. Numbers below are per-intent ground truth.
+Measurements from a 10,000-intent consolidated run on Base Sepolia. Every intent was verified on chain per-intent, by matching its witness hash against `IntentSettled` / `IntentFailed` events. To be re-confirmed on mainnet after the external audit.
 
-To be re-confirmed on mainnet after the external audit.
+Headline reliability is measured from the orchestrator-relayed path, the production surface where the orchestrator controls price freshness and relayer nonces. The self-relay surfaces are reported as feature validation, not folded into the headline.
 
-## What we measured
-
-One **consolidated production-style run** exercising every protocol surface the architecture supports:
-
-- 10,000 intents over ~23 minutes
-- 32 relayer EOAs round-robined behind a single `OrchestratorRelay` contract
-- 2 MMs deployed on Base Sepolia (one with publisher streaming PUs for the orch path + piggyback flow, one without publisher for the self-PU flow)
-- 1 MockDEX contract for the cross-external-venue flows
-- The live ERC-8211 ComposableExecutionModule on Base Sepolia (`0xf3092fad...d57`) whitelisted on settlement for the runtime-balance fee-split flow
-
-Channel mix (production-like distribution): 80% orchestrator-relayed, 20% split across 7 self-relay surfaces.
-
-## Headline (verified per-intent on chain)
+## Headline: orchestrator-relayed (production path)
 
 | Metric | Value |
 |---|---:|
-| Intents submitted | 10,000 |
-| **Verified settled** (`IntentSettled` event matched on chain) | **9,949** |
-| Verified failed (`IntentFailed` event matched on chain) | 23 |
-| Truly missing (no on-chain event found for this hash) | 28 |
-| Submit / intake errors | 0 |
-| **Overall on-chain settlement rate** | **99.49%** |
-| Total gas burnt | 357,784,829 |
+| Intents (orchestrator-relayed) | 7,995 |
+| **Settled** | **7,995** |
+| **Settlement rate** | **100.00%** |
+| Protocol failures | 0 |
+| Latency p50 / p95 | 4.9 s / 7.9 s |
+| Gas per intent | ~83k amortised |
 
-The 23 failures were `AnchorStale` reverts on piggyback channels — correct protocol behavior (the trader's tx landed in a block with no orchestrator batch in it). The 28 "truly missing" are intents the orchestrator hadn't dispatched yet when the test stopped feeding it — a queue-tail effect, not a protocol failure.
+![Per-channel settlement reliability](./perf-summary-throughput.png)
 
-## Per-channel verified results
+## Feature validation: self-relay surfaces
 
-| Channel | Submitted | Settled | Failed | Missing | Success rate | p50 latency | Gas median |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `orch-propamm` (production default) | 8,008 | **7,979** | 6 | 23 | **99.64%** | 4.6 s | ~83k (amortised) |
-| `self-pu-erc20` | 475 | **475** | 0 | 0 | **100%** | 2.5 s | 178,696 |
-| `self-pu-native` | 187 | **186** | 0 | 1 | **99.47%** | 2.2 s | 164,472 |
-| `piggyback-erc20` | 302 | **290** | 11 | 1 | **96.03%** | 2.4 s | 161,392 |
-| `piggyback-native` | 108 | **101** | 6 | 1 | **93.52%** | 2.7 s | 147,168 |
-| `self-mockdex` (cross-external-venue) | 312 | **311** | 0 | 1 | **99.68%** | 2.5 s | 132,699 |
-| `self-mixed` (PropAMM + MockDEX in one intent) | 312 | **312** | 0 | 0 | **100%** | 2.5 s | 227,935 |
-| `self-erc8211` (delegatecall ERC-8211 fee-split) | 296 | **295** | 0 | 1 | **99.66%** | 2.7 s | 232,617 |
+Every self-relay flow settled end-to-end. These are correctness checks, not the headline number.
 
-## What the numbers mean
+| Channel | Submitted | Settled | By-design reverts | Protocol failures | Verdict |
+|---|---:|---:|---:|---:|:--:|
+| `self-pu-erc20` | 540 | 540 | 0 | 0 | PASS |
+| `self-pu-native` | 209 | 209 | 0 | 0 | PASS |
+| `self-mockdex` (external venue) | 308 | 308 | 0 | 0 | PASS |
+| `self-mixed` (PropAMM + external) | 258 | 258 | 0 | 0 | PASS |
+| `self-erc8211` (delegatecall fee-split) | 271 | 271 | 0 | 0 | PASS |
+| `piggyback-erc20` | 310 | 282 | 28 | 0 | PASS |
+| `piggyback-native` | 109 | 104 | 5 | 0 | PASS |
 
-- **Self-relay channels: 1,970 settled of 1,992 submitted across 7 channels = 98.9% combined.** Three of the channels (self-pu-erc20, self-mixed) hit 100% in their respective sample sizes. The piggyback channels' lower rate (96.03% and 93.52%) is **correct protocol behavior** — piggyback only succeeds when the user's tx lands in the same block as an orchestrator batch tx, by design. Self-PU channels (where the trader supplies their own PriceUpdate) hit 99.5–100%.
+Piggyback rides the orchestrator's anchor with no price update of its own. Its 33 reverts are by-design: the trader's tx landed in a block with no orchestrator batch. That is the documented piggyback tradeoff, not a failure. Zero protocol failures on any surface.
 
-- **Orchestrator-relayed channel: 7,979 settled of 8,008 submitted = 99.64%.** Six anchor-race failures + 23 queue-tail intents at test cutoff. No protocol-level failures.
+## Whole-run integrity
 
-- **Latency: 2.2–2.7 s p50 across all self-relay channels.** That's essentially one Base Sepolia block. Orchestrator-relayed p50 is 4.6 s (one block + batcher's 200ms flush + queue depth).
+| Outcome | Count |
+|---|---:|
+| Settled | 9,967 |
+| By-design reverts (piggyback) | 33 |
+| Protocol failures | 0 |
+| Harness artifacts | 0 |
+| Truly missing | 0 |
+| In-flight at cutoff | 0 |
 
-- **Gas: 83k–233k per intent depending on route complexity.** Orchestrator-relayed intents amortise Settlement's overhead across multiple intents per batch (~2.6 intents/batch). Self-relay intents pay full per-tx overhead.
+Protocol-attributable settlement across all channels: 9,967 / 9,967 = 100.00%. Raw settled over submitted: 9,967 / 10,000 = 99.67% (the 33 are the by-design piggyback reverts).
 
-## Verification methodology
+## How it was verified
 
-The harness records every submitted intent's witness hash (computed deterministically from the Intent struct via the EIP-712 type hash) at submission time. After all submissions complete plus a 90-second drain, the harness queries `Settlement.IntentSettled` and `Settlement.IntentFailed` events from the test's exact block range in 1000-block chunks. For each submitted intent hash:
+The harness records each intent's witness hash at submit time, and self-relay submissions also record their broadcast tx hash. After the last submission it drains to quiescence: it awaits every self-relay receipt, then waits for orchestrator settlements to go quiet, only then snapshots the final block. It reconciles each hash against on-chain events. A receipt- or watcher-confirmed settlement is never downgraded by a windowed query that misses it. The run had zero false-missing, zero in-flight at cutoff, and zero measurement artifacts.
 
-- found in `IntentSettled` events → **verified settled**
-- found in `IntentFailed` events → **verified failed** (with the on-chain error selector)
-- not found in either → **truly missing**
+## Latency
 
-In this run the reconciliation fetched **9,975 settlement events** within the test block window. Of those, **9,949 unique settled hashes matched our submitted intents**, **23 unique failed hashes matched**, and **3 events had hashes NOT in our submission set** (concurrent activity, correctly excluded). 9,949 + 23 = 9,972 verified ours; the remaining 28 of 10,000 submitted are truly missing.
+Orchestrator-relayed p50 4.9 s (one Base block plus batcher flush plus per-EOA dispatch queueing under load). Self-relay p50 0.6 to 1.1 s. All-channel p95 under 8 s.
 
-## Verified guarantees
+## Gas and cost
 
-| Guarantee | Observation |
-|---|---|
-| Per-intent isolation via `try/catch` | 23 `IntentFailed` events alongside successful settlements in the same batches |
-| Receiver-snapshot delivery floor | Zero `InsufficientOutput` reverts on settled intents |
-| Signed-executor binding | Zero `ExecutorMismatch` reverts (8,008 orch intents pinned to Relay; 1,992 self-relay pinned to trader's EOA) |
-| Same-block anchor freshness | `AnchorStale` reverts only on piggyback paths where no orch batch landed in the user's block; self-PU paths committed their own anchor in the same tx and hit 99.5–100% |
-| Permit2 witness binding | Every intent's tokenIn pulled via `permitWitnessTransferFrom` with the Intent witness; zero standing approval to settlement at any point |
-| Delegatecall whitelist | All 295 settled `self-erc8211` intents delegated only to the owner-whitelisted ERC-8211 module; settlement holds zero residual after every runtime-balance sweep |
+![Gas per intent and cost vs batch density](./perf-summary-cost-per-intent.png)
 
-## Throughput model
+Per-intent gas ranges from ~133k (external venue) to ~233k (composed ERC-8211 route) on self-relay, and around 83k amortised on the orchestrator-relayed path (the batch envelope spread across roughly 2.6 intents per batch).
 
-The 7 IPS sustained submit rate hit a floor formed by three factors, none of which are protocol-level:
+At current Base gas (L1 base fee around 0.4 gwei, ETH around $2,000), the orchestrator-relayed path is about $0.008 to $0.012 per intent end to end. Cost scales roughly linearly with the L1 base fee.
 
-1. **Public Alchemy RPC tier rate limits** (the dominant factor)
-2. **Per-EOA confirmation cadence on Base Sepolia public sequencer** — ~1 tx per 2s block per EOA, theoretical ceiling ~16 batches/sec across the 32-EOA pool
-3. **Single-trader self-relay sequential nonces** — all self-relay channels share one trader EOA
+![Daily orchestrator operating cost](./perf-summary-daily-cost.png)
 
-On a dedicated RPC tier + sequencer access, the architectural ceiling lifts substantially.
+## Throughput
 
-## Cost on Base mainnet
+Sustained submit rate was around 6.5 IPS, bounded by the shared Alchemy RPC tier, not the protocol. With the 32-EOA relayer pool round-robin, the architectural ceiling lifts substantially on a dedicated RPC tier.
 
-At current Base mainnet gas (L1 base fee ~0.4 gwei, L2 gas ~0.005 gwei, ETH ~$2,000) the per-intent cost for the production-default orchestrator-relayed path is:
-
-- ~83k gas per intent at the natural batch density
-- ~**$0.008–$0.012 per intent end-to-end** depending on L1 conditions
-
-Self-relay intents pay their own tx overhead at ~150–235k gas depending on route shape — ~$0.018–$0.040 per intent.
-
-L1 calldata dominates (~85% of total). Cost scales roughly linearly with L1 base fee:
-
-| Conditions | L1 base fee | Per intent (orch-propamm) | Per intent (self-pu-erc20) |
-|---|---:|---:|---:|
-| Current Base | 0.4 gwei | $0.008 | $0.018 |
-| Slightly elevated | 1 gwei | $0.019 | $0.040 |
-| Typical Ethereum activity | 5 gwei | $0.097 | $0.20 |
-| Busy day | 15 gwei | $0.29 | $0.60 |
-| Peak congestion | 30 gwei | $0.87 | $1.80 |
+![Notional throughput capacity](./perf-summary-scale.png)
 
 ## What this run validates
 
-- Universal `Intent + Step[]` dispatch handles every route shape without protocol-side changes
-- Orchestrator-relayed and self-relay coexist cleanly under sustained load with deterministic per-intent verification
-- Per-intent try/catch isolation works under sustained load — bad intents don't poison batches
-- ERC-8211 delegatecall composability works end-to-end against the **live** module at 99.66% verified success
-- Cross-external-venue routing through `MockDEX` at 99.68% verified success
-- 32-relayer pool round-robin scales the orch path's effective throughput — 99.64% verified success on the production-default channel
+- Orchestrator-relayed settlement at 100% under sustained load
+- Every self-relay surface settles end-to-end (self-PU, piggyback, cross-venue, mixed, ERC-8211)
+- Market makers own their output pricing; the protocol enforces only the user's minimum
+- A measurement framework with zero false-missing, in-flight, or artifacts across 10,000 intents
 
 ## What this run does NOT validate
 
-- Higher target IPS — would need a dedicated RPC tier
-- Mainnet gas measurements (Sepolia's near-zero gas floor masks L1 dynamics; the per-intent gas counts transfer directly, but the cost-in-USD table above is a model not a measurement)
-- External audit findings — v3 will be re-validated after the audit
+- Higher target IPS, which needs a dedicated RPC tier
+- Mainnet gas in USD (Base Sepolia's near-zero gas floor; the per-intent gas counts transfer, the USD figures are a model)
+- External audit findings, which will be re-validated after the audit

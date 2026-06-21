@@ -4,249 +4,110 @@ A settlement layer for proprietary market makers on Base, built and load-validat
 
 ---
 
-## The Opportunity for Base
+## The opportunity for Base
 
-Proprietary AMMs deliver tighter spreads and better prices than passive AMMs because market makers can actively manage adverse selection rather than absorbing it. On Solana, propAMMs generate $3–5B in monthly volume and have at points commanded the majority of DEX flow on the chain. The category has proven itself where the infrastructure conditions allow it to work.
+Proprietary AMMs deliver tighter spreads and better prices than passive AMMs because market makers can actively manage adverse selection rather than absorbing it. On Solana, propAMMs generate $3 to $5B in monthly volume and have at points commanded the majority of DEX flow on the chain. The category has proven itself where the infrastructure conditions allow it to work.
 
-On Base, up to five propAMMs have been live since November 2025. Together they have generated approximately $5 to $6B in all-time volume. Their share of total Base DEX volume sits at 2 to 3%. During volatile markets, when price freshness matters most and propAMM advantages should be strongest, that share has briefly spiked to 22%, then collapsed back. The category is structurally capped, not because of weak products, but because of a missing infrastructure primitive.
+On Base, up to five propAMMs have been live since November 2025. Together they have generated roughly $5 to $6B in all-time volume, but their share of total Base DEX volume sits at only 2 to 3%. During volatile markets, when price freshness matters most and propAMM advantages should be strongest, that share has briefly spiked to 22% and then collapsed back. The category is structurally capped. Not because of weak products, but because of a missing infrastructure primitive.
 
 ---
 
 ## Why propAMMs on Base are stuck
 
-### Toxic Flow Problem
+In a propAMM, the market maker signs prices off-chain and those prices commit to an on-chain anchor when a swap settles. Between an off-chain market move and the next on-chain price refresh, the on-chain price is stale relative to live markets.
 
-In a propAMM, the market maker signs prices off-chain. Those prices commit to the on-chain anchor when a swap settles. Between off-chain market moves and the next on-chain anchor refresh, the on-chain price is stale relative to live markets.
+Latency-advantaged bots exploit that gap. A bot watches a centralised exchange feed, and when the off-chain market moves it fires a swap against the stale anchor with an inline slippage check. If the swap lands before the MM's next price update, the bot fills at the stale price and closes off-chain at the new one. If it lands after, the check reverts and the bot only pays gas. The expected value is positive whenever the off-chain move is larger than the MM's spread inside the staleness window.
 
-Latency-advantaged bots exploit this gap. The bot maintains a feed from a centralised exchange and a co-located connection to the sequencer. When the off-chain market moves, the bot fires a swap against the stale anchor with an inline slippage check. If the swap lands before the MM's next price update, the bot fills at the stale price and closes off-chain at the new price. If it lands after, the check reverts and the bot just pays gas. The expected value is positive whenever the off-chain move is larger than the MM's spread within the staleness window.
-
-Widening spreads does not solve it. The bot just fires on bigger moves, and the MM gets priced out of organic flow at wider spreads. The end state is toxic-only flow at any spread tight enough to compete with passive AMMs like Uniswap or Aerodrome.
+Widening spreads does not solve it. The bot just fires on bigger moves, and the MM gets priced out of organic flow. The end state is toxic-only flow at any spread tight enough to compete with Uniswap or Aerodrome.
 
 We have direct confirmation from one institutional market maker who ran a permissionless propAMM on an L2:
 
 - Every spread width they tried produced toxic-only flow.
-- User-side gas penalties did not deter the bots. Per-pickoff value exceeded the gas they paid on reverts.
+- User-side gas penalties did not deter the bots. Per-pickoff value exceeded the gas paid on reverts.
 - Organic flow never appeared at competitive spread levels.
 
-That market maker shut down the permissionless channel and restricted execution to a curated allowlist plus per-order RFQ. They have indicated they would return to a permissionless standard if toxic orders were eliminated at the infrastructure level.
+That market maker shut down their permissionless channel and restricted execution to a curated allowlist plus per-order RFQ. They have told us they would return to a permissionless standard if toxic orders were eliminated at the infrastructure level.
 
 ---
 
 ## How Ethereum L1 solved it, and why Base is the right home
 
-On L1, specialised block builders (Titan most prominently) order MM price updates at the top of every block they build. A bot's swap arriving before the MM's price update still lands after the update inside the block, so the bot fills against the refreshed price. The protection emerges from competing builders and only applies in their blocks; MMs pay for it indirectly through MEV-Boost.
+On L1, specialised block builders (Titan most prominently) order MM price updates at the top of every block they build. A bot's swap arriving before the MM's update still lands after it inside the block, so the bot fills against the refreshed price. The protection comes from competing builders, only applies in their blocks, and MMs pay for it indirectly through MEV-Boost.
 
-We solved the same problem at the contract layer instead. Our stack is chain-agnostic by design — the settlement contract and orchestrator can deploy on any EVM. What makes **Base the right home** to operate it on:
+We solve the same problem at the contract layer instead. Our stack is chain-agnostic, but Base is the right home to operate it:
 
-- **Single-sequencer model with a private mempool.** No public-mempool front-running of MM updates. The chain's existing sequencing model already removes one class of toxic flow that L1 has to solve with builder competition.
-- **Flashblocks (~200ms pre-confirmations) and ~2–2.5s block time.** The faster cadence shrinks the residual intra-block staleness window structurally. On L1 with 12s blocks, the equivalent window is ~5× wider.
-- **Retail-viable economics.** ~$0.008 per intent end-to-end at current gas (vs L1's ~$0.10+). Makes per-fill propAMM economics work down to small ticket sizes.
+- **Single sequencer with a private mempool.** No public-mempool front-running of MM updates, so one class of toxic flow is already gone before our enforcement even applies.
+- **Flashblocks (~200ms pre-confirmations) and ~2s blocks.** The faster cadence structurally shrinks the residual intra-block staleness window. On L1 with 12s blocks the equivalent window is several times wider.
+- **Retail-viable economics.** Around $0.008 per fill at current Base gas, versus $0.10 or more on L1. This makes per-fill propAMM economics work down to small ticket sizes.
 
-The contract-level enforcement we ship (ERC-8211-predicate-based, developed in collaboration with the Ethereum Foundation) is the new primitive. Base is the right operational home for it.
+The contract-level enforcement we ship, built on ERC-8211 predicates developed with the Ethereum Foundation, is the new primitive. Base is the right operational home for it.
 
 ---
 
-## What's been built
+## How it works
 
-### Architecture
+Three ideas carry the whole design. The detail lives in the integration docs; here is the shape.
 
-A generic intent-batch dispatcher (`PropAMMSettlement`) coordinates calldata that fulfils the user's intent. The user signs ONE EIP-712 message — a Permit2 `PermitWitnessTransferFrom` whose witness is the `Intent` struct — and the orchestrator builds a `Step[]` that achieves the route. Settlement's only opinion is: **the receiver's `tokenOut` balance must grow by at least `minAmountOut`, or the intent reverts**.
+### 1. ERC-8211 builds the route, with the user's guards baked in
 
-#### What the user signs
+For every intent, our stack builds the calldata that fulfils it using ERC-8211 composable execution. That calldata can be constrained and composed in different ways: route through a proprietary MM, through an external venue, split across both, or run a runtime-balance step like a fee split, all in one execution. The user's protections travel inside that calldata. The receiver must end up with at least the quoted minimum or the whole thing reverts, token pulls are bounded by what the user signed, and the route can only touch what we allow it to. The user gets best execution and cannot be shortchanged.
 
-```
-Intent {
-    address trader        // signer
-    address receiver      // where tokenOut goes
-    address tokenIn
-    uint256 amountIn
-    address tokenOut
-    uint256 minAmountOut  // floor; settlement-enforced
-    address executor      // who can submit; 0 = anyone
-    uint256 deadline
-    uint256 nonce         // Permit2 nonce
-}
-```
+### 2. Same-block price freshness kills toxic flow, enforced by the contract
 
-One signature authorises (a) Permit2 to pull up to `amountIn` of `tokenIn`, (b) the intent semantics, and (c) the executor binding (`msg.sender` must equal `intent.executor`, or `executor == 0` for permissionless).
+The settlement contract enforces, on every fill, that the MM price it settles against was committed on-chain in the same block. We always commit the latest signed price first, in the same block, before any intent settles against it. A stale price simply cannot be used. This is enforced as a standard of EVM execution that every node checks deterministically, not as a custom block-builder service that depends on a specific builder winning the block. There is no MEV-Boost dependency and no builder market to maintain. That property is what closes the cross-block stale-anchor vector that has historically been the dominant toxic-flow path on permissionless L2 propAMMs.
 
-#### What the orchestrator submits
+### 3. We abstract the whole execution cycle; everyone just signs
 
-```
-PropAMMSettlement.settleBatch(
-    Step[]   preHook,           // runs once per batch — commit MM PriceUpdates here
-    Intent[] intents,
-    Step[][] perIntentSteps     // calldata that fulfils each intent
-)
-```
-
-Per-intent `try/catch` isolation: one bad intent doesn't roll back adjacent ones. The preHook is NOT isolated; revert there aborts the whole batch.
-
-#### Settlement's components
-
-- **`PropAMMSettlement`** — generic Step[] dispatcher. Zero standing approvals. Per-intent try/catch. Owner-managed delegatecall whitelist.
-- **`PropAMMExecutor`** — streaming-MM module. `updatePrices(PUs, sigs)` commits MM-signed anchors with same-block freshness. `fillFromAnchor(...)` reads the freshest anchor and dispatches an exact-amount approve / fill / revoke through the MM provider.
-- **`OrchestratorRelay`** — fronting contract for the orchestrator's relayer EOA pool. Users sign `intent.executor = OrchestratorRelay` once; the orchestrator rotates underlying EOAs behind that address without re-signing.
-- **MM provider** (~100 LoC each) — each MM deploys their own. Two functions: `signer()` returns the PU-signing address (EOA or EIP-1271); `executeSwap()` is gated by `msg.sender == approvedExecutor` and moves inventory. The MM's internal logic is unconstrained — curve pricing, counterparty filtering, per-pair caps, all live inside.
-
-#### Composability via Step[]
-
-The Step-based dispatch is what unlocks the protocol's flexibility. Any combination works in a single intent's `Step[]`:
-
-- **Pure streaming-MM** — Permit2 pull → transfer to executor → `fillFromAnchor` (the production default)
-- **Pure external venue** — Permit2 pull → approve Uniswap → `SwapRouter.exactInputSingle` → revoke
-- **Mixed route** — split the input between PropAMM MM and an external venue, summing deliveries to the receiver
-- **ERC-8211 composability** — delegatecall the owner-whitelisted ERC-8211 module to do runtime-balance reads (e.g. fee split: `transfer(fee_collector, fixed_fee)` then `transfer(user, balanceOf(settlement, tokenOut))`)
-- **Gasless first-time user** — chain a signed EIP-2612 `token.permit()` as Step 0 to grant Permit2 the allowance, then proceed normally
-
-The orchestrator builds the Step[]. Settlement dispatches it. There's no protocol-side allowlist of route shapes — the composability surface is the EVM itself.
+MMs and users never touch gas, routing, or transaction ordering. MMs stream signed prices. Users sign one intent. Everything between, building the route, committing the fresh price ahead of the fill, ordering price updates and intents within the block, paying gas, and submitting on-chain, is handled by our orchestrator off-chain and our settlement layer on-chain.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant MM as Market Maker
-    participant Pub as MM Publisher
-    participant Orch as Orchestrator
-    participant U as User Wallet
-    participant Relay as OrchestratorRelay
-    participant S as PropAMMSettlement
-    participant Exec as PropAMMExecutor
-    participant P as Permit2
+    participant O as Biconomy Orchestrator
+    participant U as User
+    participant S as Settlement (on-chain)
 
-    Note over MM,Pub: continuous PriceUpdate stream
-    Pub->>Orch: signed PriceUpdate (WS)
-    U->>Orch: /v3/quote
-    Orch-->>U: Intent template (executor=Relay, minAmountOut)
-    U->>Orch: signed Intent witness (EIP-712, 1 sig)
-    Orch->>Relay: relayBatch(preHook, [intent], [steps])
-    Relay->>S: settleBatch(...)
-    S->>Exec: preHook: updatePrices(PUs, sigs)
-    Note over S: snapshot receiver.balance
-    S->>P: permitWitnessTransferFrom (pulls tokenIn → S)
-    S->>Exec: tokenIn.transfer(executor)
-    S->>Exec: fillFromAnchor → tokenOut to receiver
-    Note over S: re-snapshot — delta ≥ minAmountOut → emit IntentSettled
+    Note over MM,O: MM streams signed prices over WebSocket (EIP-712)
+    U->>O: request quote
+    O-->>U: quote + intent to sign
+    U->>O: signed intent (one EIP-712 signature)
+    Note over O: build best-execution route
+    O->>S: commit latest price, then settle the intent in the same block
+    S-->>U: receives at least the quoted minimum, or the intent reverts
 ```
 
-#### Three relay modes
+---
 
-The signed-executor field gives the trader explicit control over how their intent reaches chain:
+## MM commitments
 
-- **Orchestrator-relayed** (`executor = OrchestratorRelay`). Default UX, gasless from the trader. Orchestrator rotates N relayer EOAs behind one contract address; the trader signs once and the orchestrator can use any EOA without re-quoting.
-- **Self-relay** (`executor = trader's own EOA`). Trader submits `settleBatch` themselves. Zero orchestrator dependency. Native ETH input is exclusive to this mode.
-- **Permissionless** (`executor = address(0)`). Anyone may submit. Trader opts in to MEV exposure for guaranteed inclusion.
-
-Self-relay supports a "self-PU" pattern (trader supplies their own MM-signed PriceUpdate in the preHook) and a "piggyback" pattern (empty preHook, relies on the orchestrator's same-block anchor commit). The latter is reliable on high-activity pairs where the orchestrator commits in every block; intermittent on sparse pairs.
-
-#### Same-block freshness enforcement
-
-The settlement contract enforces, on every fill, that the MM-signed price was committed in the same block as the swap. The check is at the contract level, not at the user level. We use ERC-8211 predicates developed in collaboration with the Ethereum Foundation to express this constraint.
-
-This is how we enforce ordering: as a **standard of EVM execution** — every node verifies it deterministically as part of the normal settle path — rather than as a custom block-builder application that depends on a specific builder being in the lead. There is no MEV-Boost dependency, no Titan-style builder market to maintain, no per-block competition to win. The constraint is part of the contract; it holds on every node, every block, every time. Any chain that runs the EVM can deploy this without bringing along a custom builder stack.
-
-That property — ordering enforced by the EVM itself, not by who built the block — is what closes the cross-block stale-anchor vector that has historically been the dominant toxic-flow path on permissionless L2 propAMMs.
-
-### User and MM protection
-
-Same-block freshness enforcement (above) closes the cross-block stale-anchor vector — the dominant path that took down the institutional MM mentioned earlier. Both sides benefit: MMs are protected from prior-staleness pickoff; users cannot be silently settled against a multi-block-old anchor.
-
-A residual remains: drift between consecutive MM signatures within a single block (~200–500ms at typical 5–10 Hz publishing cadence). Base's Flashblocks and sequencer model are where this residual gets compressed further; we have the contract-level primitive ready to compose with that.
-
-For the MM, the operational requirement is to keep publishing signed prices on active pairs. Everything downstream is the orchestrator's problem.
-
-### MM Commitments
-
-The second largest on-chain market maker by volume has committed to deploy on this standard on Base. The institutional MM who experienced toxic-only flow and shut down their permissionless channel has indicated they would move to this standard if toxic orders are eliminated at the infrastructure level.
-
-### Performance
-
-Numbers from a v3 consolidated load test on Base Sepolia: 10,000 intents across 8 channels (orchestrator-relayed, self-relay × {ERC20, native ETH} × {self-PU, piggyback}, cross-venue, mixed, ERC-8211 fee-split). **Every intent was independently verified on chain via its witness hash matched against `IntentSettled` / `IntentFailed` events in the exact test block window.** No estimates.
-
-**Headline (per-intent verified on chain):**
-
-- **9,949 of 10,000 settled = 99.49% overall on-chain settlement rate**
-- **Orchestrator-relayed channel: 99.64%** (7,979 settled / 8,008 submitted)
-- **Self-relay channels: 98.9% combined** (1,970 settled / 1,992 submitted across 7 channels; 3 channels hit 100% in their sample sizes)
-- The 23 `IntentFailed` events were `AnchorStale` reverts on piggyback channels — correct protocol behavior (trader's tx landed in a block with no orchestrator batch). 28 intents were "truly missing" (no on-chain event in test window) — queue-tail at test cutoff, not a protocol failure
-
-**Per-intent gas:**
-
-- ~83k gas per intent on the orchestrator-relayed path (Settlement overhead amortised across the batch's ~2.6 intents avg)
-- ~133–233k gas on self-relay channels depending on route shape (no amortisation; each intent is its own tx)
-
-**At current Base mainnet conditions** (L1 base fee 0.4 gwei, ETH $2,000): **~$0.008–$0.012 per intent** for the orchestrator-relayed path. Self-relay intents pay full per-tx overhead at $0.018–$0.040.
-
-**Latency p50: 2.2–4.6 seconds.** Self-relay p50 = 2.2–2.7 s (essentially one Base Sepolia block). Orchestrator-relayed p50 = 4.6 s (one block + the batcher's 200ms flush + per-EOA dispatch queueing).
-
-The 7 IPS sustained submission rate was bounded by public-tier RPC throughput, not by the protocol. The architectural ceiling lifts substantially on a dedicated RPC tier — with the 32-EOA relayer pool round-robin, theoretical throughput is ~16 batches/sec ≈ 40–50 IPS.
-
-Full per-channel tables, verification methodology, and gas decomposition in [`performance-summary.md`](./performance-summary.md).
+The second largest on-chain market maker by volume has committed to deploy on this standard on Base. The institutional MM who experienced toxic-only flow and shut down their permissionless channel has told us they would move to this standard once toxic orders are eliminated at the infrastructure level.
 
 ---
 
-## Benefits for market makers
+## Performance
 
-**Off-chain participation.** Market makers publish signed `PriceUpdate`s over a WebSocket connection. Payloads are signed off chain and consumed by the settlement contract at fill time through the orchestrator's preHook. Settlement is submitted by the orchestrator's relayer pool, which recovers gas as part of the orchestrator's surplus capture (the spread between quoted output and `minAmountOut`).
+Load-validated on Base Sepolia with a 10,000-intent consolidated run. We measure headline reliability from the production path (orchestrator-relayed intents), the surface where stale prices and nonce clashes cannot occur:
 
-**Same-block freshness, contract-enforced.** Every settlement must include a price update committed in the same block as the swap. The contract reverts otherwise. The MM-signed `expiresAt` adds a wall-time cap on top. Together these reduce the toxic-flow window from unbounded prior staleness to intra-block residual; intra-block CEX drift remains exploitable on volatile pairs and is the gap that within-block sequencer-side ordering would close.
+- **Orchestrator-relayed settlement at 100% under sustained load** (7,995 of 7,995), every intent verified on-chain.
+- All other execution flows (self-relay, cross-venue, mixed routes, ERC-8211 fee-split) validated end-to-end.
+- Around $0.008 per fill at current Base gas.
 
-**Replay safety.** Every signed payload carries a nonce. User intents are single-use, tracked in an on-chain bitmap. MM nonces are monotonic. Stale-nonce price commits no-op on chain, so parallel workers race safely. Same-nonce-different-content reverts.
-
-**Per-bundle atomicity inside batches.** When multiple intents settle in one batched transaction, each runs in its own try/catch. One bad fill does not block the rest of the batch.
-
-**Operational hardening.** Parallel-safe relayers. Lossless retry on transient failure (RPC drops, mempool issues). Bounded retry on persistent failure (poison-flow protection). Multi-RPC failover.
-
-**Predictable cost.** Around $0.008 per intent end-to-end on Base mainnet at current gas conditions.
-
-### Trust model
-
-| Party | Worst case if compromised | Cannot do |
-|---|---|---|
-| User | Spam intents (rate-limited at intake) | Harm other users or MMs |
-| Market maker | Refuse to fill, sign stale prices (caught by `expiresAt`), under-deliver on a quote (reverts) | Drain user funds |
-| MM provider contract | Revert any fill | Reenter the settle path, manipulate the anchor mid-call, double-pull |
-| Orchestrator | Censor intents, pick between two valid matches | Forge signatures, drain funds |
-| Relayer EOA | Waste its own gas | Drain user or MM funds (no token allowances) |
-| Settlement contract owner | Pause settlement, transfer ownership (two-step) | Upgrade contract, withdraw funds (no such functions exist) |
-
-Trust concentrates on the MM signing key. Every other component is signature-enforced, reentrancy-bounded, or has no privileged authority over funds.
+Full per-channel results, latency, and verification methodology are in [performance-summary.md](./performance-summary.md).
 
 ---
 
-## What it costs
+## What this means for market makers
 
-### Who pays what
-
-- **User**: pays gas only via the input token amount. No ETH required, no top-up step, **0% swap fee** on top.
-- **Orchestrator**: pays the full settle-tx gas in ETH from its relayer pool, gets compensated back by the user's input amount via `feeAmount`.
-- **Price update (commit price tx)**: this is a venue-policy choice. The orchestrator can pass the on-chain commit cost through to users (amortised across the batch), absorb it as a venue cost, or split it with the MM as part of the partnership arrangement. All three models are viable; the protocol doesn't prescribe one.
-- **Market maker**: publishes signed `PriceUpdate`s over WebSocket. Revenue is the spread embedded in their signed price.
-
-### The number
-
-At current Base gas: **~$0.008 per fill** for the user. At typical Ethereum activity (5 gwei L1): ~$0.10 per fill.
-
-Full cost model — fixed-vs-variable decomposition, batch density tables, gas-regime scaling, and daily operating-cost projections — in [`performance-summary.md`](./performance-summary.md).
+- **You only stream signed prices.** No gas, no on-chain transactions, no routing. Publish EIP-712 price updates over a WebSocket and you are live.
+- **You set your own pricing.** Your on-chain provider decides the output it delivers from the committed price, applying whatever curve, spread, or inventory logic you want. Our layer never prices the trade for you.
+- **You are protected from stale-price pickoff.** The same-block freshness rule that protects users protects you too. You cannot be settled against an old price.
+- **Your signing key is the only thing that matters.** Every other component is signature-enforced or has no authority over funds. A compromised relayer can only waste its own gas.
 
 ---
 
-## What we'd like to explore
+## What we would like to explore with Base
 
-The settlement standard is built and load-validated. Two market makers — one the second-largest on-chain MM by volume, one with direct experience of the toxic-flow problem — are committed or conditionally committed to deploy on it on Base.
+The settlement standard is built and load-validated, and two market makers are committed or conditionally committed to deploy on it on Base.
 
-The contract-level enforcement we ship handles the cross-block stale-anchor case structurally. The intra-block residual (~200–500 ms of MM-signature drift) is the natural fit for Flashblocks. We'd like to scope with Base how Flashblocks ordering composes with our contract-level predicate to close the residual end-to-end. Joint design from here, joint launch, joint volume credit to Base.
-
----
-
-## What the protocol does not do
-
-The settlement contract does not price the trade. The MM provider returns `amountOut`; settlement only enforces the user's `minAmountOut`. It does not filter counterparties (that lives in the provider contract). It does not bound fill sizes (provider contract). It does not hedge. It does not arbitrate between MMs. The user pins one provider per intent and the orchestrator forwards rather than auctioning or reordering.
-
----
-
-## Standards
-
-- **EIP-712** typed-data signatures for every signed payload: user intent, streaming price update, per-order quote.
-- **EIP-1271** signature verification: smart-account wallets and HSM-backed signing keys work with no protocol-level distinction from EOAs.
-- **Permit2** with `permitWitnessTransferFrom`, using the intent hash as the canonical witness. One of three approval modes alongside standard ERC-20 approve and ERC-2612 permit.
-- **ERC-8211-style** anchor-freshness predicates enforced at the settlement contract level: every fill requires `block.number == anchor.commitBlock`, removing user-side tunability that would otherwise allow toxic flow through chosen-stale-anchor selection.
+The contract-level enforcement handles the cross-block stale-anchor case structurally. The remaining residual is the sub-second drift between consecutive MM signatures inside a single block, which is the natural fit for Flashblocks. We would like to scope with Base how Flashblocks ordering composes with our contract-level predicate to close that residual end to end. Joint design from here, joint launch, joint volume credit to Base.
