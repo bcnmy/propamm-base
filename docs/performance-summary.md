@@ -12,20 +12,22 @@ The orchestrator-relayed path is the production default. All headline numbers be
 | Settled | 7,988 |
 | Settlement rate | 100% |
 | Gas per intent | ~83k (batch envelope amortised across the batch) |
-| Cost per intent | ~$0.008 to $0.012 at current Base gas |
+| Cost per intent | ~$0.008 to $0.012 (projected, see Cost) |
 | Settlement latency | 2.2s p50, 3.3s p95 |
+
+## Sustained load
+
+The run held a steady submission rate for the full ~26 minutes, and settlement tracked submission the whole way. The two lines stay together, so no settlement backlog built up under sustained load.
+
+![Sustained load over the run](./perf-summary-sustained.png)
 
 ## Cost
 
-Gas per intent falls as more intents share a batch, since the batch envelope is amortised across them. At current Base gas the orchestrator-relayed path runs about $0.008 to $0.012 per intent, and scales roughly linearly with the L1 base fee.
+Gas per intent is measured (~83k amortised on the orchestrator-relayed path, falling as more intents share a batch). The USD figures are a projection from that gas at mainnet conditions (L1 base fee ~0.4 gwei, ETH ~$2,000), about $0.008 to $0.012 per intent, scaling roughly linearly with the L1 base fee. The load test itself ran on Base Sepolia, where gas is near zero, so the dollar figures are a model on measured gas, not a measured mainnet cost. The two charts below are models on that basis.
 
-![Cost per intent vs batch density](./perf-summary-cost-per-intent.png)
+![Cost per intent vs batch density (model)](./perf-summary-cost-per-intent.png)
 
-![Daily orchestrator operating cost](./perf-summary-daily-cost.png)
-
-## Scale
-
-![Notional throughput capacity](./perf-summary-scale.png)
+![Daily orchestrator operating cost (model)](./perf-summary-daily-cost.png)
 
 ## Execution modes
 
@@ -50,4 +52,4 @@ Orchestrator-relayed settlement is **2.2s p50, 3.3s p95**, measured from the set
 
 ## Throughput
 
-The run sustained about 6.5 intents/sec of submission. That ceiling is the test harness, which signs each intent with an RPC round-trip and submits self-relay intents sequentially through a single trader EOA. It is not the RPC endpoint (a private Alchemy URL) and not the protocol. On the protocol side, the batcher flushes up to 20 intents every 200ms and the 32-EOA relayer pool dispatches many batches per block, so the architectural ceiling is far higher.
+The run sustained about 6 intents/sec of submission (see the sustained-load chart above). That ceiling is the test harness, which signs each intent with an RPC round-trip and submits self-relay intents sequentially through a single trader EOA. It is not the RPC endpoint (a private Alchemy URL) and not the protocol. On the protocol side, the batcher flushes up to 20 intents every 200ms and the 32-EOA relayer pool dispatches many batches per block, so the architectural ceiling is far higher.
