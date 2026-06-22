@@ -115,7 +115,7 @@ sequenceDiagram
 
     Note over MM,Pub: continuous PriceUpdate stream
     Pub->>Orch: signed PriceUpdate (WS)
-    U->>Orch: /v3/quote
+    U->>Orch: /quote
     Orch-->>U: Intent template (executor=Relay, minAmountOut)
     U->>Orch: signed Intent witness (EIP-712, 1 sig)
     Orch->>Relay: relayBatch(preHook, [intent], [steps])
