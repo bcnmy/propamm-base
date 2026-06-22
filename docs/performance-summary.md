@@ -8,12 +8,12 @@ The orchestrator-relayed path is the production default. All headline numbers be
 
 | Metric | Value |
 |---|---:|
-| Intents | 7,995 |
-| Settled | 7,995 |
+| Intents | 7,988 |
+| Settled | 7,988 |
 | Settlement rate | 100% |
 | Gas per intent | ~83k (batch envelope amortised across the batch) |
 | Cost per intent | ~$0.008 to $0.012 at current Base gas |
-| Settlement latency | 2.1s p50, 3.2s p95 |
+| Settlement latency | 2.2s p50, 3.3s p95 |
 
 ## Cost
 
@@ -33,7 +33,7 @@ Every execution mode was exercised in the same run and settles end-to-end.
 
 | Mode | Result |
 |---|---|
-| Orchestrator-relayed (default) | 100% (7,995 / 7,995) |
+| Orchestrator-relayed (default) | 100% (7,988 / 7,988) |
 | Self-relay, self-supplied price | settles |
 | Cross-venue routing | settles |
 | Mixed PropAMM + external venue | settles |
@@ -42,11 +42,11 @@ Every execution mode was exercised in the same run and settles end-to-end.
 
 ## How it was verified
 
-Each intent's witness hash is recorded at submit time. After the last submission the harness waits for the system to go quiet (every self-relay receipt confirmed and orchestrator settlements stopped arriving) before snapshotting, then reconciles every hash against `IntentSettled` / `IntentFailed` events. An independent re-query of the chain confirmed 9,967 settled across all modes, with zero orchestrator-relayed failures (verified by the tx sender of every failed event).
+Each intent's witness hash is recorded at submit time. After the last submission the harness waits for the system to go quiet (every self-relay receipt confirmed and orchestrator settlements stopped arriving) before snapshotting, then reconciles every hash against `IntentSettled` / `IntentFailed` events. An independent re-query of the chain confirmed 9,964 settled across all modes, with zero orchestrator-relayed failures (verified by the tx sender of every failed event).
 
 ## Latency
 
-Orchestrator-relayed settlement is **2.1s p50, 3.2s p95**, measured from the settled event's block timestamp minus submit time (true on-chain settle time, not observation lag). That is about one Base block after dispatch plus the batcher's 200ms flush window. The batcher flushes a pair's bucket when it reaches 20 intents or 200ms, whichever comes first.
+Orchestrator-relayed settlement is **2.2s p50, 3.3s p95**, measured from the settled event's block timestamp minus submit time (true on-chain settle time, not observation lag). That is about one Base block after dispatch plus the batcher's 200ms flush window. The batcher flushes a pair's bucket when it reaches 20 intents or 200ms, whichever comes first.
 
 ## Throughput
 

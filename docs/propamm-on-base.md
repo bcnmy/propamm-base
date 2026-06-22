@@ -162,10 +162,10 @@ The second largest on-chain market maker by volume has committed to deploy on th
 
 A 10,000-intent consolidated load test on Base Sepolia, every intent verified on chain by its witness hash. The orchestrator-relayed path is the production default and the basis for these numbers:
 
-- **Settlement rate: 100%** (7,995 of 7,995 orchestrator-relayed intents settled).
+- **Settlement rate: 100%** (7,988 of 7,988 orchestrator-relayed intents settled).
 - **Gas: ~83k per intent**, the batch envelope amortised across the batch.
 - **Cost: ~$0.008 to $0.012 per intent** at current Base gas.
-- **Settlement latency: 2.1s p50, 3.2s p95** (about one Base block plus the batcher's 200ms flush).
+- **Settlement latency: 2.2s p50, 3.3s p95** (about one Base block plus the batcher's 200ms flush).
 
 The other execution modes were exercised in the same run and all settle end-to-end: self-relay with a self-supplied price, cross-venue routing, mixed PropAMM-plus-venue routes, and the ERC-8211 fee-split. Piggyback self-relay (riding the orchestrator's anchor with no price of its own) settles whenever the trader's tx shares a block with an orchestrator batch, which is the common case on active pairs.
 
